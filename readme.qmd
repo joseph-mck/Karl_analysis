@@ -20,3 +20,6 @@ pacman::p_load(tidyverse, targets, gt)
 here::here()
 ```
 
+Notes:
+Smokers all no.
+One snp all the same.
