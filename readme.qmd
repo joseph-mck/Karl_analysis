@@ -1,12 +1,9 @@
 ---
 title: README
-author: Jono Tuke
+author: Joseph McKinnon
 date: today
 date-format: long
-format: 
-  html: 
-    self-contained: true
-    df-print: tibble
+format: gfm
 editor_options: 
   chunk_output_type: console
 execute: 
@@ -14,12 +11,13 @@ execute:
   message: false
 ---
 
-```{r}
+```{r echo = FALSE}
 #| label: setup
 pacman::p_load(tidyverse, targets, gt)
 here::here()
 ```
 
 Notes:
-Smokers all no.
-One snp all the same.
+
+- Smokers all no.
+- One snp all the same (rs123456).
