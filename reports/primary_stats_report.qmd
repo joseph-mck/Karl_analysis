@@ -1,0 +1,489 @@
+---
+title: Treatment Effect Analysis
+author: Joseph McKinnon
+date: today
+format: 
+  pdf:
+    fig-pos: "H"
+    tbl-pos: "H"
+editor_options: 
+  chunk_output_type: console
+execute: 
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r, setup}
+pacman::p_load(
+  readxl,
+  tidymodels,
+  tidyverse,
+  gt
+)
+
+# Loading
+dataset1 <-
+  read_excel(here::here("raw-data", "FITFR-final-data-v3.xlsx"),
+             skip = 1,
+             n_max = 100)
+
+dataset2 <-
+  read_excel(here::here("raw-data", "FITFR-extra-data.xlsx"),
+             n_max = 10)
+
+dataset <- rbind(dataset1, dataset2)
+
+# Recoding
+dataset <- dataset %>%
+  mutate(
+    age = as.integer(age),
+    age = ifelse(age >= 0 & age <= 120, age, NA),
+    sex = ifelse(tolower(sex) %in% c("male", "m"),
+                 "Male",
+                 ifelse(tolower(sex) %in% c("female", "f"), "Female", NA)),
+    treatment = toupper(treatment)
+    )
+
+# Remove rows where there are missing values
+dataset <- dataset %>%
+  filter(complete.cases(.))
+
+# Convert categorical columns to factors
+snp_cols <- grep("^rs", names(dataset), value = TRUE)
+dataset[snp_cols] <- lapply(dataset[snp_cols], as.factor)
+dataset$sex <- as.factor(dataset$sex)
+dataset$treatment <- as.factor(dataset$treatment)
+dataset$smoker <- as.factor(dataset$smoker)
+dataset$PR <- as.factor(dataset$PR)
+
+# Remove columns where all entries are the same
+to_remove <- dataset %>%
+  select(where(~ length(unique(.)) < 2))
+dataset <- dataset %>%
+  select(where(~ length(unique(.)) >= 2))
+
+# Seting up cross validation
+set.seed(123)
+num_folds <- 5
+dataset_cv <- vfold_cv(dataset, v = num_folds)
+```
+
+## Introduction
+
+### Dataset and Context
+This research is based upon contains demographic and genetic information for 110 patients and their responses to three treatments. In more detail the variables are:
+
+- Demographics (4 variables): 
+  - Age: integer
+  - Sex: Male or Female
+  - Treatment: A, B or C
+  - Smoker: Whether the patient is a smoker (true or false)
+- Genetics (51 variables): The genetic variation for a series of Single Nucleotide Polymorphisms (SNPs). These are categorical combiations of nucleotide alleles (e.g. AA, CC, CG). The column names for these variables are rs followed by 5 numbers (e.g. rs93874).
+- Response (2 variables): 
+  - PR: Whether the patient had a positive response (no or yes)
+  - AF: Activating factor (AF) of the patient (continuous variable)
+
+
+### Research question
+The key research question is:
+What is the effect of the treatment on the activating factor (AF) and the probability of a positive response (PR), after adjusting for the effect of age, smoking status, and genetics?
+
+### Data cleaning & pre-processing
+Cleaning and preprocessing was done to the data so that it was representative of the true data collected. The key steps done were:
+- Age: Converted to an integer and ages below 0 and above 120 were set to missing (NA) as these are not valid ages.
+- Sex: Converted to lower case then all entries of 'm' and 'male' were set to 'Male' and all entries of 'f' and 'female' were set to 'Female'. Other entries would be set to missing (NA) by default.
+- Treatment: All entries were set to uppercase as there was a mix of upper and lower case.
+
+All rows with a missing entry were then removed, this reduced the data set to 108 entries.
+
+Sex, Treatment, Smoker, PR, and the genetic variables were converted to categorical variables.
+
+Finally, the Smoker column was removed as each of the entries were the same, and therefore its effect on PR and AF could not be analysed. The ID column was also removed as a variable.
+
+
+
+## Method
+
+### Model Choice
+
+Two models were selected for this analysis. 
+
+For analysing the effect of treatment on AF adjusting for age, sex and genetics LASSO linear regression will be used. This is because there are the number of parameters and data points are on a similar scale which increases the chance of over fitting without regularisation as provided by the LASSO model. LASSO shrinks coefficients, performing variable selection when coefficients are shrunk to 0.
+
+A LASSO logistic regression model will be used for analysing the effect of treatment on PR adjusting for age, sex and genetics. This is because logistic regression is appropriate for binary response variables and regularisation from LASSO is necessary.
+
+### Tuning & implementation
+For the LASSO approach both with linear and logistic regression there is a penalty term that requires tuning from the data. Tuning would usually necessitate splitting the data into a training and test set. However, as the data set is already small, 5-fold cross-validation will be used on its own to force the tuning to be generalisable to different data.
+
+The first model fit was the LASSO linear regression for predicting AF. The predictors were age, sex, treatment and the SNPs. PR was removed as the objective of the research is to learn the effect treatment considering demographic and genetics without considering the downstream outcome.
+
+An additional LASSO linear regression for predicting AF was fit also including interaction terms between treatment and age due to non-linearity.
+
+For the LASSO linear regression models the penalty parameter was tuned based on the RMSE of the model.
+
+The final model fit was the LASSO logistic regression for predicting PR. The predictors were age, sex, treatment and the SNPs. AF was removed to allow the model to uncover the relationships between demographic and genetics without information leakage from AF. This model was tuned based on brier score.
+
+
+## Results
+
+```{r, no_interaction_AF_model}
+#| include: false
+AF_recipeNo <-
+  recipe(AF ~ ., data = dataset) |>
+  step_rm(PR) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+AF_modelNo <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_mode("regression") |>
+  set_engine("glmnet")
+
+AF_wfNo <- workflow(AF_recipeNo, AF_modelNo)
+
+doParallel::registerDoParallel()
+
+search_grid <- grid_regular(penalty(), levels = 50)
+
+AF_tuneNo <- tune_grid(
+  AF_wfNo,
+  resamples = dataset_cv,
+  grid = search_grid
+)
+
+collect_metrics(AF_tuneNo)
+
+AF_penaltyNo <- select_best(AF_tuneNo, metric = "rmse")
+
+AF_wfNo <- AF_wfNo |>
+  finalize_workflow(AF_penaltyNo)
+
+AF_fitNo <- AF_wfNo |> fit(dataset)
+
+af_augNo <- dataset |>
+  mutate(
+    .fitted = predict(AF_fitNo, new_data = dataset)$.pred,
+    .resid = AF - .fitted
+  )
+```
+
+@fig-no-interaction shows that the residual vs fitted values are not randomly scattered for the LASSO linear regression for AF without interaction terms. There is a clear U shaped trend.
+```{r}
+#| echo: false
+#| label: fig-no-interaction
+#| fig-cap: "Residuals vs Fitted Plot for AF LASSO linear regression model (coloured by treatment)."
+
+ggplot(af_augNo, aes(.fitted, .resid, colour = treatment)) +
+  geom_point() +
+  geom_hline(yintercept = 0) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals",
+    colour = "Treatment",
+    title = "AF model: Residuals vs Fitted"
+  )
+
+```
+
+```{r, AF_model_interaction}
+#| include: false
+AF_recipe <-
+  recipe(AF ~ ., data = dataset) |>
+  step_rm(PR) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_interact(terms = ~ starts_with("treatment"):age) |>
+  step_normalize(all_numeric_predictors())
+
+AF_model <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_mode("regression") |>
+  set_engine("glmnet")
+
+AF_wf <- workflow(AF_recipe, AF_model)
+
+doParallel::registerDoParallel()
+
+search_grid <- grid_regular(penalty(), levels = 50)
+
+AF_tune <- tune_grid(
+  AF_wf,
+  resamples = dataset_cv,
+  grid = search_grid
+)
+
+collect_metrics(AF_tune)
+```
+
+```{r, AF_model_penalty_table1}
+#| include: false
+AF_summary <- show_best(AF_tune, metric = "rmse") |>
+  mutate(
+    sd = std_err * sqrt(num_folds),
+    relative_sd = sd / mean
+  ) |>
+  transmute(
+    penalty,
+    metric = .metric,
+    mean = round(mean, 3),
+    relative_sd = round(relative_sd, 3)
+  )
+AF_summary |>   
+  gt() |>
+  fmt_scientific(
+    columns = penalty,
+    decimals = 2
+  )
+AF_relative_sd <- AF_summary$relative_sd[1]
+```
+
+@fig-AF_model_tune shows the observed RMSE and r-square values from the tuning of the penalty parameter with 5-fold cross-validation. It can be seen that the RMSE values are minimised when the penalty parameter is less than $0.5$. This is reflected in @tbl-AF_penalty_tab which shows that the optimal penalty value is  `r signif(AF_summary$penalty[1], 3)`, however, there is minimal difference in the effect on the model among the best values.
+```{r, tune_plot}
+#| echo: false
+#| label: fig-AF_model_tune
+#| fig-cap: "Scatterplot of RMSE and r-square for the different penalty values in the LASSO model."
+
+
+AF_tune |> autoplot()
+```
+
+```{r, AF_model_penalty_table}
+#| echo: false
+#| label: tbl-AF_penalty_tab
+#| tbl-cap: "Table of the top 5 penalty values by RMSE from the 5-fold cross-validation for the data. Relative SD is the SD divided by the mean."
+AF_summary <- show_best(AF_tune, metric = "rmse") |>
+  mutate(
+    sd = std_err * sqrt(num_folds),
+    relative_sd = sd / mean
+  ) |>
+  transmute(
+    penalty,
+    metric = .metric,
+    mean = round(mean, 3),
+    relative_sd = round(relative_sd, 3)
+  )
+AF_summary |>   
+  gt() |>
+  fmt_scientific(
+    columns = penalty,
+    decimals = 2
+  )
+AF_relative_sd <- AF_summary$relative_sd[1]
+```
+
+```{r, finalising_model}
+#| include: false
+AF_penalty <- select_best(AF_tune, metric = "rmse")
+
+
+AF_wf <- AF_wf |>
+  finalize_workflow(AF_penalty)
+```
+
+@fig-AF_model_importance shows which variables are most important in the model for predicting AF. The interaction terms between age and treatment B and C as well as age by itself are linked to higher AF.
+```{r, plot_AF_importance}
+#| echo: false
+#| label: fig-AF_model_importance
+#| fig-cap: "Plot of variable importance in the LASSO Linear Regression model for AF with interaction terms. This shows the variables that are most important in the predictions for the model."
+
+
+AF_fit <- AF_wf |> fit(dataset)
+AF_fit |>
+  extract_fit_parsnip() |>
+  vip::vi() |>
+  filter(Importance > 0.5) |>
+  mutate(
+    Variable = fct_reorder(Variable, Importance)
+  ) |>
+  ggplot(aes(Importance, Variable, fill = Sign)) +
+  geom_col() +
+  harrypotter::scale_fill_hp_d("Ravenclaw")
+```
+
+
+@fig-interaction_residual shows that the residual vs fitted values are fairly randomly scattered for the LASSO linear regression for AF with interaction terms.
+```{r, residual_plot_af}
+#| echo: false
+#| label: fig-interaction_residual
+#| fig-cap: "Residuals vs Fitted Plot for AF LASSO linear regression model with age-treatment interaction terms (coloured by treatment)."
+
+af_aug <- dataset |>
+  mutate(
+    .fitted = predict(AF_fit, new_data = dataset)$.pred,
+    .resid = AF - .fitted
+  )
+
+ggplot(af_aug, aes(.fitted, .resid, colour = treatment)) +
+  geom_point() +
+  geom_hline(yintercept = 0) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals",
+    colour = "Treatment",
+    title = "AF model: Residuals vs Fitted"
+  )
+```
+
+
+```{r, PR_model}
+PR_recipe <-
+  recipe(PR ~ ., data = dataset) |>
+  step_rm(AF) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+PR_model <- logistic_reg(penalty = tune(), mixture = 1) |>
+  set_mode("classification") |>
+  set_engine("glmnet")
+
+PR_wf <- workflow(PR_recipe, PR_model)
+
+doParallel::registerDoParallel()
+
+search_grid <- grid_regular(penalty(), levels = 50)
+
+PR_tune <- tune_grid(
+  PR_wf,
+  resamples = dataset_cv,
+  grid = search_grid
+)
+```
+
+```{r, PR_model_penalty_table1}
+#| include: false
+PR_summary <- show_best(PR_tune, metric = "brier_class") |>
+  mutate(
+    sd = std_err * sqrt(num_folds),
+    relative_sd = sd / mean
+  ) |>
+  transmute(
+    penalty = round(penalty, 3),
+    metric = .metric,
+    mean = round(mean, 3),
+    relative_sd = round(relative_sd, 3)
+  )
+PR_summary |> gt()
+PR_relative_sd <- PR_summary$relative_sd[1]
+```
+
+@fig-PR_model_tune shows the observed accuracy, brier score, and ROC_AUC values from the tuning of the penalty parameter with 5-fold cross-validation. It can be seen that the brier score values are minimised when the penalty parameter is approximately in between 0.05 and 0.25. This is reflected in @tbl-PR_penalty_tab which shows that the optimal penalty value is `r signif(PR_summary$penalty[1], 3)`.
+```{r, tune_plot_PR}
+#| echo: false
+#| label: fig-PR_model_tune
+#| fig-cap: "Scatterplot of accuracy, brier score, and ROC_AUC for the different penalty values in the LASSO model."
+
+
+PR_tune |> autoplot()
+```
+
+```{r, PR_model_penalty_table}
+#| echo: false
+#| label: tbl-PR_penalty_tab
+#| tbl-cap: "Table of the top 5 penalty values by brier score from the 5-fold cross-validation for the data. Relative SD is the SD divided by the mean."
+PR_summary <- show_best(PR_tune, metric = "brier_class") |>
+  mutate(
+    sd = std_err * sqrt(num_folds),
+    relative_sd = sd / mean
+  ) |>
+  transmute(
+    penalty = round(penalty, 3),
+    metric = .metric,
+    mean = round(mean, 3),
+    relative_sd = round(relative_sd, 3)
+  )
+PR_summary |> gt()
+PR_relative_sd <- PR_summary$relative_sd[1]
+```
+
+
+```{r, finalising_model_PR}
+#| include: false
+PR_penalty <- select_best(PR_tune, metric = "brier_class")
+
+PR_wf <- PR_wf |>
+  finalize_workflow(PR_penalty)
+```
+
+@tbl-PR_non_zeros shows which variables have a non-zero coefficient in the model for predicting PR. The model only has non-zero terms for the intercept, age, when SNP rs91154 has allele TT and when SNP rs56579 has allele AG. The coefficients for the SNPs are small.
+```{r, plot_AF_importance}
+#| echo: false
+#| label: tbl-PR_non_zeros
+#| tbl-cap: "Table of the coefficents for the LASSO logistic regression model predicting PR."
+
+PR_fit <- PR_wf |> fit(dataset)
+
+coef_table_PR <- PR_fit |>
+  extract_fit_parsnip() |>
+  tidy()
+
+nonzero_coef_PR <- coef_table_PR |>
+  filter(estimate != 0)
+nonzero_coef_PR |>
+  gt() |>
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 3
+  )
+```
+
+
+@fig-calibration shows the calibration curve for the PR model. It follows the $45^{\circ}$ line with some small fluctuations but no clear trend.
+```{r, cal_plot}
+#| echo: false
+#| label: fig-calibration
+#| fig-cap: "Callibration curve for PR LASSO logistic regression model."
+
+pr_probs <- predict(PR_fit, dataset, type = "prob") |>
+  bind_cols(dataset |> select(PR))
+
+cal_data <- pr_probs |>
+  mutate(bin = ntile(.pred_yes, 10)) |>
+  group_by(bin) |>
+  summarise(
+    mean_pred = mean(.pred_yes),
+    observed = mean(as.numeric(PR == "yes"))
+  )
+
+ggplot(cal_data, aes(mean_pred, observed)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    x = "Predicted probability",
+    y = "Observed proportion",
+    title = "Calibration curve (PR model)"
+  )
+```
+
+
+## Discussion
+
+### Treatment effect analysis
+The analysis effectively addresses the research question except for accounting for smoking status effect as all patients in the data did not smoke.
+
+@fig-no-interaction showed a clear trend in the residuals vs fitted plot which suggests non-linearity that was not captured by the AF model without interaction terms. 
+
+Once age-treatment interaction terms were added to the model @fig-interaction_residual showed a random scatter which suggests the linearity assumption of the LASSO regression model is satisfied.
+
+The importance of the variables in the AF model with interaction terms suggests that the key predictors of AF were age and its interaction with treatments. The most important predictor was treatment B and its interaction with age, this had a positive effect. This suggests that when the positive effect of age on AF is increased when using treatment B compared to reference treatment A. Similar is true for treatment C. Age also has a positive effect on AF at the reference level (treatment A). The sex of the patient did not have a notable impact on the AF and neither did any on the genetic variables (SNPs)
+
+To analyse the effect of the variables on PR a LASSO logistic regression model was used. The only terms with non-zero coefficients were the intercept, age and for two SNPs. The positive coefficient of age suggests that when age increases there is an increased probability of a PR. For SNP rs91154 the positive coefficient associated with allele 'TT' suggests that this has an increasing effect on the probability of a PR compared to the reference level, although the effect is small. Similar can be said of SNP rs56579 with allele AG, although its small effect is decreasing the probability of a PR. The fact that the coefficients of the other variables were reduced to zero suggests that they do not impact whether a patient has a PR. The variables that do not impact PR includes treatment.
+
+To summarise, treatment does have an effect on AF but this is linked to the age of the patient. The other variables considered including sex and genetics do not have clear effects. Treatment does not have a clear effect on the whether a patient has a PR. SNP rs91154 and rs56579, were shown to have an effect while the remaining variables did not.
+
+### Limitations & caveats
+There are limitations and caveats to this LASSO model approach. LASSO can effectively reduce the coefficients of variables that are not important for predictions, highlighting those that are important, but unless specifically modeled, it will miss interactions. This means that if two SNPs had no effect alone but significant effect when combined this would be missed.
+
+An additional limitation of using the LASSO model is the interpret-ability. While the importance can be extracted from the model these values lack physical interpret-ability.
+
+It should also be noted that LASSO can reduce weak signals. Therefore, even if each SNP had small effects to the point where combined the genetic effect was meaningful, coefficients could be reduced to 0.
+
+The LASSO models also required tuning. This means that the models that were fit could only be suited to the data set the tuning was done on. To minimise the risk of this over fitting, 5-fold cross-validation was done with the aim of ensuring generalisability. In many cases over fitting is assessed with a 'testing' set that is not used in tuning, however, due to the data limitations (only 108 patients) cross-validation was relied upon. Given that cross validation was fairly stable with a relative standard deviation between folds of `r AF_relative_sd` (@tbl-AF_penalty_tab) and `r PR_relative_sd` (@tbl-PR_penalty_tab) for the AF and PR LASSO models respectively, substantial over fitting seems unlikely.
+
+
+## Citations
+Wickham H, Bryan J (2025). _readxl: Read Excel Files_. R package version 1.4.5, <https://CRAN.R-project.org/package=readxl>.
+
+Kuhn et al., (2020). Tidymodels: a collection of packages formodeling and machine learning using tidyverse principles. https://www.tidymodels.org
+
+Wickham H, Averick M, Bryan J, Chang W, McGowan LD, François R, Grolemund G, Hayes A, Henry L, Hester J, Kuhn M, Pedersen TL, Miller E, Bache SM, Müller K, Ooms J, Robinson D, Seidel DP, Spinu V, Takahashi K, Vaughan D, Wilke C, Woo K, Yutani H (2019). “Welcome to the tidyverse.” _Journal of Open Source Software_,*4*(43), 1686. doi:10.21105/joss.01686 <https://doi.org/10.21105/joss.01686>.
+
+Iannone R, Cheng J, Schloerke B, Haughton S, Hughes E, Lauer A, François R, Seo J, Brevoort K, Roy O (2026). _gt: Easily Create Presentation-Ready Display Tables_. R package version 1.3.0, <https://CRAN.R-project.org/package=gt>

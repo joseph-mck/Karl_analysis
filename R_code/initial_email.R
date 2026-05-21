@@ -9,11 +9,20 @@ library(inspectdf)
 library(table1)
 library(naniar)
 library(knitr)
+library(showtext)
+library(ggrepel)
+library(tidymodels)
 
-dataset <-
+dataset1 <-
   read_excel(here::here("raw-data", "FITFR-final-data-v3.xlsx"),
              skip = 1,
              n_max = 100)
+
+dataset2 <-
+  read_excel(here::here("raw-data", "FITFR-extra-data.xlsx"),
+             n_max = 10)
+
+dataset <- rbind(dataset1, dataset2)
 
 head(dataset)
 
@@ -75,7 +84,7 @@ to_remove <- dataset %>%
 dataset <- dataset %>%
   select(where(~ length(unique(.)) >= 2))
 
-dataset$PR_num <- as.numeric(as.factor(dataset$PR)) - 1
+#dataset$PR_num <- as.numeric(as.factor(dataset$PR)) - 1
 
 saveRDS(dataset, here::here("data", "initial_dataset_clean.rds"))
 
@@ -113,7 +122,7 @@ ggplot(dataset, aes(x = age, y = AF, colour = treatment)) +
 # AF vs Age by Treatment [Trend line]
 ggplot(dataset, aes(x = age, y = AF, colour = treatment)) +
   geom_point() +
-  geom_smooth(method = "lm", se = False) +
+  geom_smooth(method = "lm", se = FALSE) +
   labs(title = "AF vs Age by Treatment",
        x = "Age",
        y = "AF")
@@ -186,18 +195,18 @@ ggplot(dataset, aes(x = PR, y = AF, fill = PR)) +
 
 
 # PR vs age
-dataset$PR_num <- as.numeric(as.factor(dataset$PR)) - 1
-ggplot(dataset, aes(x = age, y = PR_num)) +
-  geom_jitter(height = 0.05) +
-  geom_smooth(method = "glm",
-              method.args = list(family = "binomial"), se = FALSE) +
-  scale_y_continuous(
-    breaks = c(0,1),
-    labels = levels(dataset$PR)
-  ) +
-  labs(title = "PR vs Age",
-       x = "Age",
-       y = "PR")
+# dataset$PR_num <- as.numeric(as.factor(dataset$PR)) - 1
+# ggplot(dataset, aes(x = age, y = PR_num)) +
+#   geom_jitter(height = 0.05) +
+#   geom_smooth(method = "glm",
+#               method.args = list(family = "binomial"), se = FALSE) +
+#   scale_y_continuous(
+#     breaks = c(0,1),
+#     labels = levels(dataset$PR)
+#   ) +
+#   labs(title = "PR vs Age",
+#        x = "Age",
+#        y = "PR")
 
 
 
@@ -340,3 +349,192 @@ inspect_num(dataset) |> show_plot()
 inspect_cat(dataset) |> show_plot()
 
 table1(~ AF + age + PR | treatment, data = dataset)
+
+
+############################# KARL TASK PLOT
+# extremes <- dataset %>%
+#   select(AF, sex, treatment, ID) %>%
+#   group_by(treatment, sex) %>%
+#   filter(AF == max(AF) | AF == min(AF)) %>%
+#   ungroup()
+#
+# ## Add font
+# font_add(
+#   family = "times",
+#   regular = here::here(
+#     "figs",
+#     "Times New Roman.ttf"
+#   )
+# )
+# # Set running
+# showtext_auto()
+#
+# col_pal <- c("#006699", "#B35900")
+#
+# # AF vs Treatment (by sex)
+# karl_plot_01 <- ggplot(dataset, aes(x = treatment, y = AF, fill = sex)) +
+#   geom_boxplot(position = position_dodge(width = 1)) +
+#   geom_point(
+#     data = extremes,
+#     aes(group = sex),
+#     shape = 21,
+#     size = 1,
+#     color = "black",
+#     position = position_dodge(width = 1)
+#   ) +
+#   geom_text(
+#     data = extremes,
+#     aes(
+#       label = paste0("ID: ", ID),
+#       group = sex
+#     ),
+#     position = position_dodge(width = 1),
+#     hjust = -0.1,
+#     size = 20,
+#     family = "times"
+#   ) +
+#   stat_summary(fun = "mean",
+#                geom = "point",
+#                shape = 22,
+#                size = 3,
+#                fill = "white",
+#                aes(group = sex),
+#                position = position_dodge(width = 1))+
+#   labs(title = "Boxplot of AF against treatment",
+#        subtitle = "White squares are sample means",
+#        x = "Treatment",
+#        y = "Activating factor",
+#        caption = "Produced by Jono and Joseph"
+#        )+
+#   theme(
+#     text = element_text(size = 70, family = "times"),
+#
+#     panel.background = element_rect(fill = "white", colour = NA),
+#     plot.background  = element_rect(fill = "white", colour = NA),
+#
+#     panel.grid.major = element_blank(),
+#     panel.grid.minor = element_blank(),
+#
+#     axis.line = element_line(colour = "black"),
+#
+#     legend.background = element_blank(),
+#     legend.key = element_blank(),
+#
+#     legend.position = "top",
+#     plot.caption = element_text(hjust = 1)
+#   ) +
+#   scale_fill_manual(values = col_pal)
+#
+# ggsave(
+#   filename = here::here('figs', "Karl_plot_01.tiff"),
+#   plot = karl_plot_01,
+#   width = 9,
+#   height = 6,
+#   units = "in",
+#   dpi = 500,
+#   compression = "lzw"
+# )
+#
+# karl_plot_01
+
+# model <- glm(
+#   PR ~ treatment + AF + age,
+#   data = dataset,
+#   family = binomial(link = "logit")
+# )
+#
+# summary(model)
+
+dataset_cv <- vfold_cv(dataset)
+#######################################AF
+AF_recipe <-
+  recipe(AF ~ ., data = dataset) |>
+  step_rm(PR) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+AF_model <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_mode("regression") |>
+  set_engine("glmnet")
+
+AF_wf <- workflow(AF_recipe, AF_model)
+
+doParallel::registerDoParallel()
+
+search_grid <- grid_regular(penalty(), levels = 50)
+
+AF_tune <- tune_grid(
+  AF_wf,
+  resamples = dataset_cv,
+  grid = search_grid
+)
+
+collect_metrics(AF_tune)
+AF_tune |> autoplot()
+
+show_best(AF_tune, metric = "rmse")
+
+penalty <- select_best(AF_tune, metric = "rmse")
+
+AF_wf <- AF_wf |>
+  finalize_workflow(penalty)
+
+
+AF_fit <- AF_wf |> fit(dataset)
+AF_fit |>
+  extract_fit_parsnip() |>
+  vip::vi() |>
+  filter(Importance > 1) |>
+  mutate(
+    Variable = fct_reorder(Variable, Importance)
+  ) |>
+  ggplot(aes(Importance, Variable, fill = Sign)) +
+  geom_col() +
+  harrypotter::scale_fill_hp_d("Ravenclaw")
+
+##################################################### PR
+PR_recipe <-
+  recipe(PR ~ ., data = dataset) |>
+  step_rm(AF) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+PR_model <- logistic_reg(penalty = tune(), mixture = 1) |>
+  set_mode("classification") |>
+  set_engine("glmnet")
+
+PR_wf <- workflow(PR_recipe, PR_model)
+
+doParallel::registerDoParallel()
+
+search_grid <- grid_regular(penalty(), levels = 50)
+
+PR_tune <- tune_grid(
+  PR_wf,
+  resamples = dataset_cv,
+  grid = search_grid
+)
+
+collect_metrics(AF_tune)
+PR_tune |> autoplot()
+
+show_best(PR_tune, metric = "roc_auc")
+
+penalty <- select_best(PR_tune, metric = "roc_auc")
+
+PR_wf <- PR_wf |>
+  finalize_workflow(penalty)
+
+
+PR_fit <- PR_wf |> fit(dataset)
+PR_fit |>
+  extract_fit_parsnip() |>
+  vip::vi() |>
+  filter(Importance > 1) |>
+  mutate(
+    Variable = fct_reorder(Variable, Importance)
+  ) |>
+  ggplot(aes(Importance, Variable, fill = Sign)) +
+  geom_col() +
+  harrypotter::scale_fill_hp_d("Ravenclaw")
+
